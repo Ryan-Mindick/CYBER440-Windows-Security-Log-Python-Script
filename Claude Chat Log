@@ -1,0 +1,193 @@
+Write me a python script that can ingest XML data as pasted above and return it to me in a clean way that is easy to read.
+
+Created a file, shared a file, ran a command
+I tested the script on a couple of your sample events. It prints this table:
+
+Time (UTC)           Record   Event ID  Description  Computer      Account              Account Type  Logon Type   Logon ID
+2011-04-16 15:07:42  1410956  4634      Logoff       DC01.AFC.com  AFC\WS070$           Computer      3 - Network  0x3675687
+2011-04-16 15:07:47  1410960  4634      Logoff       DC01.AFC.com  AFC\Adam.Richardson  User          3 - Network  0x3674f21
+Below the table it adds a summary: the total number of events, the time range, and counts by event type and by account.
+
+How to use it:
+
+Run python parse_events.py events.xml to read a saved file.
+Run python parse_events.py with no file name to paste the XML straight into the terminal. Press Ctrl+D (Mac/Linux) or Ctrl+Z then Enter (Windows) when you’re done pasting.
+Add --csv out.csv to save the results for Excel.
+Add --details to print every raw field, including SIDs, for each event.
+A few things it does for you:
+
+It handles pasted <Event> blocks that aren’t wrapped in a single root element, which is how your sample is laid out.
+It sorts the events chronologically, since the log lists newest first.
+It trims the timestamps.
+It translates common event IDs (4624 logon, 4625 failed logon, and so on) and logon type codes into plain words.
+It flags accounts ending in $ as computer accounts, so you can tell workstations like WS070$ apart from real users.
+It only uses Python’s standard library, so there’s nothing to install.
+
+
+Parse events
+PY 
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+Rewrite the script so I can upload an XML file via a directory into the code and it runs the whole XML file. The file I have is 650k lines so copy and pasting isn't an option
+
+Shared a file, ran 3 commands
+The script now reads your file straight from disk, so you don’t have to paste anything. I tested it on a 760,000-line file with 95,000 events, and it finished in about 3.5 seconds.
+
+You can point it at your file in any of three ways:
+
+Edit the path in the code. Near the top of the script, set INPUT_PATH = r"C:\Users\YourName\Downloads\security_log.xml", then run python parse_events.py. Keep the r before the quotes; it stops Windows backslashes from causing problems.
+Pass it on the command line, for example python parse_events.py "C:\path\to\security_log.xml".
+Use the file picker. Leave INPUT_PATH empty and run the script with no arguments, and a window opens so you can browse to the file.
+You can also point it at a folder instead of a single file. It will process every .xml file inside and combine the results.
+
+With a file that large, printing every row to the terminal wouldn’t be readable. Instead, the terminal shows a summary and the first 25 events. The summary includes counts by event type, account, account type, and computer. The full results are saved next to your input file:
+
+yourfile_clean.csv has one row per event and opens directly in Excel for filtering and sorting.
+yourfile_report.txt has the summary plus the full readable table of every event.
+The script handles your pasted-style format, where the events aren’t wrapped in a root element. It also handles the standard Event Viewer “Save as XML” export, which is wrapped in <Events>. If the file has a corrupted section partway through, the script keeps everything it read before that point and prints a warning instead of crashing.
+
+
+Parse events
+PY 
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+Build a new script that includes all Windows Event ID's and a description of each. Also include all Logon types and any other information it needs to be completed accurately
+
+Shared a file, ran 3 commands
+The new script is event_log_analyzer.py. You run it the same way as before: set INPUT_PATH, pass the file path, or use the file picker. I tested it on a 760,000-line file and it finished in about 4 seconds.
+
+A note on “all” event IDs: Windows has thousands of event IDs, spread across hundreds of different logging sources, and many sources reuse the same numbers. So a single complete list isn’t possible. Here’s what the script covers:
+
+The Windows Security log, in full. This is every audit event Microsoft documents for Vista / Server 2008 and later, roughly 400 IDs. It covers logons, account changes, Kerberos, object access, policy changes, the firewall, certificate services, and more. Your DC01.AFC.com data comes from this log.
+Common events from other logs. These include System log startup, shutdown, and crash events; services being installed or crashing; Remote Desktop sessions; PowerShell; Task Scheduler; Windows Defender; and Sysmon.
+Some IDs show up in more than one log with different meanings. For example, 7001 means different things for Service Control Manager and for Winlogon. The script looks at which program logged the event to pick the right description.
+
+If an event isn’t in the reference, it’s labeled “Not in reference table,” and the summary lists those events so nothing gets hidden.
+
+The other information it decodes:
+
+Logon types 0–13. Each gets a name and a plain-English meaning.
+Success or failure. Every event is marked Audit Success or Audit Failure, taken from the event’s own success/failure flag.
+Failure codes. For example, 0xC000006A means the password was wrong, and 0xC0000234 means the account is locked out.
+Kerberos result codes, encryption types, and pre-authentication types. For example, 0x18 on a Kerberos failure means a bad password.
+Coded values. Some fields contain codes like %%2313 instead of text; these are translated (that one means “Unknown user name or bad password”).
+Well-known accounts. Built-in account IDs like SYSTEM or ANONYMOUS LOGON are labeled.
+Other fields. Source IP and port, workstation, process, and authentication package each get their own column. Any remaining fields are decoded into a “Details” column.
+The summary also shows:
+
+Failed logons broken down by account, by failure reason, and by source IP.
+A breakdown of logon types.
+Quick lookup without a file: you can check a single code directly, for example:
+
+python event_log_analyzer.py --lookup 4740
+python event_log_analyzer.py --lookup 0xC000006A
+The full results are saved to a _clean.csv file and a _report.txt file next to your input, as before. The CSV now includes a marker that makes Excel display special characters correctly.
+
+
+Event log analyzer
+PY 
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+Write a new script that does not export to Excel, for some reason Python isn't allowing it to work even though I've installed 'openpyxl'. Export a file in another way that still builds it in a tableesque way that is easy to read and understand.
+
+Shared a file, read 2 files, ran 6 commands
+The new script is event_log_report.py. It creates one HTML file, yourfile_report.html, which opens in any web browser (Chrome, Edge, Firefox, Safari). It uses only Python’s built-in libraries, so there’s nothing to install.
+
+Put your file path on line 41 this time, the INPUT_PATH = r"" line, then run python event_log_report.py. When it finishes, the report opens in your browser automatically.
+
+The report has two tabs:
+
+Summary tab
+
+A row of totals at the top: total events, the first and last event times, success and failure counts, failed logons, and how many accounts and computers appear.
+Breakdown tables: by event ID, result, logon type, account type, and the top accounts, computers, and source IPs. There are also tables of failed logons by account, by reason, and by source IP.
+Each count has a small bar underneath it, so the biggest items stand out at a glance.
+Click any row to jump to the matching events. For example, clicking an account under “Failed logons by account” shows that account’s failed logons.
+Events tab
+
+A table of every event, with a search box that looks through every field.
+Filters for Result and Event ID, plus a “Failed logons only” checkbox.
+Click any column heading to sort by it.
+It starts with the 12 most useful columns. “Show all columns” reveals the rest, including the full decoded details.
+Failed events are marked with a red stripe and red text.
+I tested it on the 760,000-line file. The report took 1.5 seconds to write, came out to 34 MB, and took about 2.5 seconds to open in Chrome.
+
+Why Excel didn’t work: this usually happens when openpyxl got installed into a different copy of Python than the one running the script. If you want to try the Excel version again later, install it with python -m pip install openpyxl. Use the same python command you use to run the script, so it installs into the right copy.
+
+
+Event log report
+PY 
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+Edit the code to also include the TargetUserName of each parsed log
+
+Shared a file, read a file, ran a command
+The Events table now has a Target User Name column, right after Primary Account. It’s visible by default, so you don’t have to click “Show all columns” to see it.
+
+This column shows the raw TargetUserName value exactly as it appears in each event, for example Adam.Richardson or WS070$. That’s different from the Target Account column, which adds the domain in front (AFC\Adam.Richardson). Events that don’t have a TargetUserName, or that have - in it, show a blank cell.
+
+The search box includes this column too, and you can click its heading to sort by it. The path setting is still on line 41.
+
+
+Event log report
+PY 
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+Change the code so that the top 25 accounts are only accounts that do NOT start with "AFC"
+
+Exclude AFC-prefixed accounts from the Top 25 table and test Failed
+The edit went in; my old test folder was gone, so I’ll re-test with fresh sample data.
+
+Shared a file, ran a command
+The “Top 25 accounts” table now skips any account that starts with “AFC”. The match ignores capitalization, so “afc” and “Afc” are skipped too. A note under the table heading says those accounts are excluded.
+
+I tested it with a mix of accounts. AFC\Adam.Richardson, AFC\WS070$ and the other AFC accounts were left out, while grant.larson and NT AUTHORITY\ANONYMOUS LOGON still appeared.
+
+A few things to know:
+
+The prefix is a setting on line 40: EXCLUDE_ACCOUNT_PREFIX = "AFC". You can change it to a different prefix, or set it to "" to turn the filter off.
+Only the Top 25 table changes. The Events tab, the account count at the top, and “Failed logons by account” still include AFC accounts.
+The table may come out nearly empty. The filter checks the full account name, which includes the domain, and in your sample every event has the domain AFC. So AFC\Adam.Richardson counts as starting with “AFC”. If you meant to skip names that start with “AFC” without the domain, like AFC-Server$, I can switch the check to the Target User Name column instead.
+
+Event log report
+PY 
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+Also add a section that flags any suspicious logs such as timestamps occurring in the early hours of the morning or constant log ons/offs or anything else that an security analyst would find worrying
+
+The report now has a Suspicious activity tab between Summary and Events. It lists each finding with a severity (High, Medium or Low), the account or source involved, the time range, the number of events, and a plain-English reason it matters. Click any finding to see exactly the events behind it.
+
+What it looks for
+
+High severity:
+
+Successful logon after repeated failures, which can mean a password was guessed.
+Password spraying, where one IP address fails against many different accounts.
+Audit log cleared, a classic way to cover tracks.
+Changes to privileged groups, such as someone being added to Domain Admins.
+Defender disabled or malware detected.
+Medium severity:
+
+Password guessing: 5 or more failed logons on one account within 10 minutes.
+Off-hours activity by real users. Remote Desktop or keyboard logons rank higher than background network logons.
+Rapid repeated logons/logoffs: 60 or more within 10 minutes by one person.
+Logon attempts on disabled, expired or locked accounts, or with user names that don’t exist.
+Account lockouts.
+New user accounts and password resets done by someone else.
+New services or scheduled tasks, which is how malware often survives reboots.
+Audit policy or firewall changes.
+Kerberos attack signs, such as Kerberoasting and AS-REP roasting.
+Low severity: logons from many sources in one hour, use of the built-in Administrator account, pass-the-hash-style logons, and clock changes made by users.
+
+Computer accounts (names ending in $) and system accounts are left out of the off-hours and logon/logoff checks. They log on around the clock normally and would bury the real findings.
+
+Other changes
+
+The Events tab has a new Flags column showing which rules each event triggered.
+There’s a new “Flagged events only” checkbox on the Events tab.
+The Summary tab shows two new totals: high-severity findings and other findings.
+The terminal prints the top 15 findings when the script runs.
+One setting you should check: event times are in UTC, so “off-hours” depends on UTC_OFFSET_HOURS (around line 44). It’s set to 0 right now. If the AFC computers were on US Eastern time, set it to -4 (summer) or -5 (winter); otherwise 3 AM UTC is actually 11 PM local. The off-hours window is set to midnight to 6 AM by default, and every other threshold sits right below that setting if a rule turns out too noisy or too quiet for your log.
+
+I tested it on a log with each of these patterns planted in it. All of them were caught, and the normal daytime traffic wasn’t flagged. A 95,000-event file finished in about 9 seconds.
+
+Treat the findings as leads to investigate, not confirmed attacks. For example, a backup job running under someone’s account could look like rapid logons.
+
+
+Event log report
+PY 
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
