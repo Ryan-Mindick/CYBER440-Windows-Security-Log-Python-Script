@@ -37,6 +37,24 @@ OUTPUT (saved next to the input)
 # Mac example:      "/Users/yourname/Downloads/security_log.xml"
 INPUT_PATH = r"C:\Users\rjmin\Downloads\XML Data"
 OPEN_WHEN_DONE = True      # open the report in your browser when finished
+EXCLUDE_ACCOUNT_PREFIX = "AFC"   # "Top 25 accounts" skips accounts starting with this (not case-sensitive)
+
+# ---- Suspicious activity settings ------------------------------------------
+# Event times are stored in UTC. Set the offset of the time zone the computers
+# are in so "off-hours" means their local night. US Eastern: -5 in winter, -4 in summer.
+UTC_OFFSET_HOURS = 0
+OFF_HOURS_START = 0              # local hour off-hours begin (0 = midnight)
+OFF_HOURS_END = 6                # local hour off-hours end (6 = 6 AM)
+BRUTE_FORCE_THRESHOLD = 5        # failed logons on one account ...
+BRUTE_FORCE_WINDOW_MIN = 10      # ... within this many minutes
+SPRAY_ACCOUNTS = 5               # one source failing on this many different accounts ...
+SPRAY_WINDOW_MIN = 30            # ... within this many minutes
+SUCCESS_AFTER_FAIL_COUNT = 3     # failures followed by a success ...
+SUCCESS_AFTER_FAIL_MIN = 30      # ... within this many minutes
+CHURN_THRESHOLD = 60             # logon/logoff events by one person ...
+CHURN_WINDOW_MIN = 10            # ... within this many minutes
+MANY_SOURCES = 5                 # one person logging on from this many sources in an hour
+KERBEROAST_SERVICES = 5          # weak-encryption tickets for this many different services
 # ----------------------------------------------------------------------------
 
 import argparse
@@ -47,8 +65,8 @@ import sys
 import time
 import webbrowser
 import xml.etree.ElementTree as ET
-from collections import Counter
-from datetime import datetime
+from collections import Counter, defaultdict
+from datetime import datetime, timedelta
 from pathlib import Path
 
 
@@ -1117,6 +1135,7 @@ def event_to_row(ev):
         "_sort": time_raw,
         "Time (UTC)": format_time(time_raw),
         "_dt": parse_time(time_raw),
+        "_data": data,
         "Record": system.get("EventRecordID", ""),
         "Channel": system.get("Channel", ""),
         "Provider": provider,
@@ -1166,13 +1185,13 @@ def parse_file(path):
 FAILED_LOGON_IDS = ("4625", "4771", "4776")
 
 REPORT_COLUMNS = [
-    "Time (UTC)", "Event ID", "Description", "Result", "Computer", "Primary Account",
+    "Time (UTC)", "Event ID", "Description", "Result", "Flags", "Computer", "Primary Account",
     "Target User Name", "Account Type", "Logon Type", "Source IP", "Workstation", "Status", "Sub Status",
     "Failure Reason", "Subject Account", "Target Account", "Logon Type Meaning",
     "Source Port", "Process", "Auth Package", "Logon ID", "Level", "Channel",
     "Provider", "Record", "Other Details",
 ]
-KEY_COLUMN_COUNT = 13          # the first 13 columns show by default
+KEY_COLUMN_COUNT = 14          # the first 14 columns show by default
 
 
 def primary_account(r):
@@ -1209,9 +1228,13 @@ def build_sections(rows):
     add("Events by account type", ["Account type"],
         [([none(t)], n, {"Account Type": t}) for (t,), n in group(rows, lambda r: (r["Account Type"],))],
         "Accounts ending in $ are computer accounts.")
+    prefix = EXCLUDE_ACCOUNT_PREFIX.lower()
+    other_accounts = [r for r in rows
+                      if not (prefix and primary_account(r).lower().startswith(prefix))]
     add("Top 25 accounts", ["Account"],
         [([none(a)], n, {"Primary Account": a})
-         for (a,), n in group(rows, lambda r: (primary_account(r),), 25)])
+         for (a,), n in group(other_accounts, lambda r: (primary_account(r),), 25)],
+        f'Excludes accounts starting with "{EXCLUDE_ACCOUNT_PREFIX}".' if prefix else "")
     add("Top 25 computers", ["Computer"],
         [([none(c)], n, {"Computer": c}) for (c,), n in group(rows, lambda r: (r["Computer"],), 25)])
     add("Top 25 source IP addresses", ["Source IP"],
@@ -1248,6 +1271,323 @@ def summary_lines(rows):
 
 
 # ============================================================================
+#  SUSPICIOUS ACTIVITY DETECTION
+# ============================================================================
+# Each rule looks for a pattern a security analyst would want to review. A
+# finding is a lead, not proof: always check the matching events before acting.
+
+SEVERITY_ORDER = {"High": 0, "Medium": 1, "Low": 2}
+BUILTIN_NAMES = {"system", "local service", "network service", "anonymous logon", "-", ""}
+LOGON_EVENTS = {"4624", "4625", "4634", "4647", "4648", "4778", "4779", "4800", "4801"}
+CHURN_EVENTS = {"4624", "4634", "4647"}
+PRIV_GROUP_WORDS = ("admin", "enterprise", "schema", "operators", "remote desktop",
+                    "dnsadmins", "group policy creator", "key admins")
+
+
+def raw(r, *names):
+    for n in names:
+        v = r["_data"].get(n, "")
+        if v and v != "-":
+            return v
+    return ""
+
+
+def account_name(r):
+    """Bare account name used to group events (no domain, lower case)."""
+    return (raw(r, "TargetUserName") or raw(r, "SubjectUserName")).lower()
+
+
+def is_person(r):
+    """True for real user accounts (not computers, built-ins or virtual accounts)."""
+    name = account_name(r)
+    return bool(name) and not name.endswith("$") and name not in BUILTIN_NAMES \
+        and not name.startswith(("dwm-", "umfd-"))
+
+
+def local_hour(dt):
+    return (dt + timedelta(hours=UTC_OFFSET_HOURS)).hour
+
+
+def in_off_hours(dt):
+    h = local_hour(dt)
+    if OFF_HOURS_START <= OFF_HOURS_END:
+        return OFF_HOURS_START <= h < OFF_HOURS_END
+    return h >= OFF_HOURS_START or h < OFF_HOURS_END      # window crosses midnight
+
+
+def bursts(items, window_seconds, threshold):
+    """items: time-sorted list of (datetime, row_index). Returns groups of items where
+    at least `threshold` fall inside any `window_seconds` window (overlaps merged)."""
+    episodes, cur, i = [], None, 0
+    for j in range(len(items)):
+        while (items[j][0] - items[i][0]).total_seconds() > window_seconds:
+            i += 1
+        if j - i + 1 >= threshold:
+            if cur and i <= cur[1]:
+                cur[1] = j
+            else:
+                if cur:
+                    episodes.append(cur)
+                cur = [i, j]
+    if cur:
+        episodes.append(cur)
+    return [items[a:b + 1] for a, b in episodes]
+
+
+def detect_suspicious(rows):
+    findings = []
+
+    def add(sev, rule, who, idxs, detail):
+        idxs = sorted(set(idxs))
+        if not idxs:
+            return
+        times = [rows[i]["_dt"] for i in idxs if rows[i]["_dt"]]
+        findings.append({
+            "severity": sev, "rule": rule, "who": who, "rows": idxs, "detail": detail,
+            "first": min(times).strftime("%Y-%m-%d %H:%M:%S") if times else "",
+            "last": max(times).strftime("%Y-%m-%d %H:%M:%S") if times else "",
+        })
+
+    def label(i):
+        return primary_account(rows[i]) or account_name(rows[i]) or "(unknown)"
+
+    by_eid = defaultdict(list)
+    for i, r in enumerate(rows):
+        by_eid[r["Event ID"]].append(i)
+    timed = lambda idxs: [(rows[i]["_dt"], i) for i in idxs if rows[i]["_dt"]]
+
+    failed = [i for i, r in enumerate(rows) if is_failed_logon(r)]
+
+    # 1. Audit log cleared
+    cleared = by_eid["1102"] + [i for i in by_eid["104"] if "eventlog" in rows[i]["Provider"].lower()]
+    if cleared:
+        add("High", "Audit log cleared", ", ".join(sorted({label(i) for i in cleared})), cleared,
+            "Someone cleared an event log. Attackers often do this to hide what they did.")
+
+    # 2. Brute force: many failed logons against one account in a short time
+    per_acct = defaultdict(list)
+    for i in failed:
+        per_acct[account_name(rows[i])].append(i)
+    for name, idxs in per_acct.items():
+        for ep in bursts(timed(idxs), BRUTE_FORCE_WINDOW_MIN * 60, BRUTE_FORCE_THRESHOLD):
+            sev = "High" if len(ep) >= BRUTE_FORCE_THRESHOLD * 4 else "Medium"
+            ips = sorted({rows[i]["Source IP"] for _, i in ep if rows[i]["Source IP"]})
+            add(sev, "Possible password guessing", label(ep[0][1]), [i for _, i in ep],
+                f"{len(ep)} failed logons for this account within {BRUTE_FORCE_WINDOW_MIN}-minute windows"
+                + (f", from {', '.join(ips[:5])}" if ips else "") + ".")
+
+    # 3. Password spraying: one source failing against many different accounts
+    per_ip = defaultdict(list)
+    for i in failed:
+        ip = rows[i]["Source IP"] or rows[i]["Workstation"]
+        if ip and ip not in ("127.0.0.1", "::1"):
+            per_ip[ip].append(i)
+    for ip, idxs in per_ip.items():
+        for ep in bursts(timed(idxs), SPRAY_WINDOW_MIN * 60, SPRAY_ACCOUNTS):
+            names = {account_name(rows[i]) for _, i in ep}
+            if len(names) >= SPRAY_ACCOUNTS:
+                add("High", "Possible password spraying", ip, [i for _, i in ep],
+                    f"{len(ep)} failed logons against {len(names)} different accounts from this source.")
+
+    # 4. Successful logon right after repeated failures
+    acct_events = defaultdict(list)
+    for i in failed + by_eid["4624"]:
+        if rows[i]["_dt"]:
+            acct_events[account_name(rows[i])].append(i)
+    for name, idxs in acct_events.items():
+        idxs.sort(key=lambda i: rows[i]["_dt"])
+        recent, hits = [], []
+        for i in idxs:
+            t = rows[i]["_dt"]
+            recent = [f for f in recent if (t - rows[f]["_dt"]).total_seconds() <= SUCCESS_AFTER_FAIL_MIN * 60]
+            if rows[i]["Event ID"] == "4624":
+                if len(recent) >= SUCCESS_AFTER_FAIL_COUNT:
+                    hits.extend(recent + [i])
+                    recent = []
+            else:
+                recent.append(i)
+        if hits:
+            add("High", "Successful logon after repeated failures", label(hits[-1]), hits,
+                f"The account logged on successfully after {SUCCESS_AFTER_FAIL_COUNT}+ failures within "
+                f"{SUCCESS_AFTER_FAIL_MIN} minutes. A guessed password is one possible explanation.")
+
+    # 5. Logons to disabled, expired or locked accounts; logons with made-up user names
+    bad_state = {"0xc0000072": "disabled", "0xc0000193": "expired", "0xc0000234": "locked out",
+                 "0xc000006f": "outside allowed hours", "0xc0000070": "from a restricted workstation"}
+    grouped = defaultdict(list)
+    unknown_users = defaultdict(list)
+    for i in by_eid["4625"] + by_eid["4776"]:
+        code = (raw(rows[i], "SubStatus") or raw(rows[i], "Status")).lower()
+        if code in bad_state:
+            grouped[(account_name(rows[i]), bad_state[code])].append(i)
+        elif code == "0xc0000064":
+            unknown_users[rows[i]["Source IP"] or rows[i]["Workstation"] or "(unknown source)"].append(i)
+    for (name, state), idxs in grouped.items():
+        add("Medium", f"Logon attempt on {state} account", label(idxs[0]), idxs,
+            f"{len(idxs)} attempt(s) to use an account that is {state}.")
+    for src, idxs in unknown_users.items():
+        names = {account_name(rows[i]) for i in idxs}
+        if len(names) >= 3:
+            add("Medium", "Logons with non-existent user names", src, idxs,
+                f"{len(idxs)} attempts using {len(names)} user names that don't exist, "
+                "which suggests someone guessing account names.")
+
+    # 6. Account lockouts
+    locks = defaultdict(list)
+    for i in by_eid["4740"]:
+        locks[account_name(rows[i])].append(i)
+    for name, idxs in locks.items():
+        add("Medium", "Account locked out", label(idxs[0]), idxs,
+            f"Locked out {len(idxs)} time(s). Check the failed logons just before each lockout.")
+
+    # 7. Off-hours activity by people (not computers)
+    off = defaultdict(list)
+    for i, r in enumerate(rows):
+        if r["Event ID"] in LOGON_EVENTS and r["_dt"] and is_person(r) and in_off_hours(r["_dt"]):
+            off[account_name(r)].append(i)
+    for name, idxs in off.items():
+        interactive = [i for i in idxs if raw(rows[i], "LogonType") in ("2", "7", "10", "11")
+                       or rows[i]["Event ID"] in ("4625", "4778")]
+        sev = "Medium" if interactive else "Low"
+        add(sev, "Activity during off-hours", label(idxs[0]), idxs,
+            f"{len(idxs)} logon/logoff events between {OFF_HOURS_START:02d}:00 and {OFF_HOURS_END:02d}:00 "
+            f"local time" + (f", including {len(interactive)} hands-on-keyboard, Remote Desktop or failed logons"
+                             if interactive else "") + ".")
+
+    # 8. Constant logons / logoffs (rapid churn)
+    churn = defaultdict(list)
+    for e in CHURN_EVENTS:
+        for i in by_eid[e]:
+            if is_person(rows[i]):
+                churn[account_name(rows[i])].append(i)
+    for name, idxs in churn.items():
+        items = sorted(timed(idxs))
+        for ep in bursts(items, CHURN_WINDOW_MIN * 60, CHURN_THRESHOLD):
+            add("Medium", "Rapid repeated logons/logoffs", label(ep[0][1]), [i for _, i in ep],
+                f"{len(ep)} logon/logoff events within {CHURN_WINDOW_MIN}-minute windows. Can indicate "
+                "scripted access, a tool scanning the network, or a misconfigured service using a person's account.")
+
+    # 9. One person logging on from many different sources within an hour
+    per_hour = defaultdict(list)
+    for i in by_eid["4624"]:
+        r = rows[i]
+        if r["_dt"] and is_person(r):
+            per_hour[(account_name(r), r["_dt"].replace(minute=0, second=0, microsecond=0))].append(i)
+    many = defaultdict(list)
+    for (name, _), idxs in per_hour.items():
+        srcs = {rows[i]["Source IP"] or rows[i]["Workstation"] for i in idxs} - {""}
+        if len(srcs) >= MANY_SOURCES:
+            many[name].extend(idxs)
+    for name, idxs in many.items():
+        srcs = sorted({rows[i]["Source IP"] or rows[i]["Workstation"] for i in idxs} - {""})
+        add("Low", "Logons from many different sources", label(idxs[0]), idxs,
+            f"Logged on from {len(srcs)} different addresses/workstations within an hour "
+            f"({', '.join(srcs[:5])}{'...' if len(srcs) > 5 else ''}). Could be credential theft or lateral movement.")
+
+    # 10. Changes to privileged groups
+    for e, verb in (("4728", "added to"), ("4732", "added to"), ("4756", "added to"),
+                    ("4729", "removed from"), ("4733", "removed from"), ("4757", "removed from")):
+        for i in by_eid[e]:
+            grp = raw(rows[i], "TargetUserName")
+            member = raw(rows[i], "MemberName", "MemberSid")
+            m = re.match(r"CN=([^,]+)", member)
+            member = m.group(1) if m else member
+            by = primary_account({**rows[i], "Target Account": ""}) or "(unknown)"
+            privileged = any(w in grp.lower() for w in PRIV_GROUP_WORDS)
+            add("High" if privileged else "Low",
+                "Privileged group membership changed" if privileged else "Group membership changed",
+                grp, [i], f"{member or 'A member'} was {verb} {grp} by {by}.")
+
+    # 11. Account management
+    acct_rules = {
+        "4720": ("Medium", "User account created"), "4726": ("Medium", "User account deleted"),
+        "4722": ("Low", "User account enabled"), "4724": ("Medium", "Password reset by another account"),
+        "4781": ("Medium", "Account renamed"), "4765": ("High", "SID History added to an account"),
+        "4766": ("High", "Failed attempt to add SID History"),
+        "4794": ("High", "Directory Services Restore Mode password set attempt"),
+        "4782": ("High", "Password hash of an account was accessed"),
+    }
+    for e, (sev, rule) in acct_rules.items():
+        idxs = by_eid[e]
+        if e == "4724":   # self-service resets are normal
+            idxs = [i for i in idxs if raw(rows[i], "SubjectUserName").lower() != raw(rows[i], "TargetUserName").lower()]
+        if idxs:
+            targets = sorted({raw(rows[i], "TargetUserName") or "?" for i in idxs})
+            add(sev, rule, ", ".join(targets[:5]) + ("..." if len(targets) > 5 else ""), idxs,
+                f"{len(idxs)} event(s). Confirm each change was authorised.")
+
+    # 12. Persistence: new services and scheduled tasks
+    for e, rule, field in (("4697", "New service installed", "ServiceName"),
+                           ("7045", "New service installed", "ServiceName"),
+                           ("4698", "Scheduled task created", "TaskName")):
+        for i in by_eid[e]:
+            name = raw(rows[i], field) or "(unnamed)"
+            path = raw(rows[i], "ServiceFileName", "ImagePath")
+            add("Medium", rule, f"{name} on {rows[i]['Computer']}", [i],
+                "Malware often installs services or tasks to survive reboots."
+                + (f" Runs: {path}" if path else ""))
+
+    # 13. Security controls weakened, malware detected
+    control_rules = {
+        "4719": ("Medium", "Audit policy changed"), "4906": ("Medium", "CrashOnAuditFail changed"),
+        "4950": ("Low", "Windows Firewall setting changed"), "5025": ("Medium", "Windows Firewall service stopped"),
+        "4946": ("Low", "Firewall rule added"), "4948": ("Low", "Firewall rule deleted"),
+        "5001": ("High", "Defender real-time protection disabled"),
+        "1116": ("High", "Malware detected by Defender"), "1117": ("High", "Defender acted on malware"),
+        "1006": ("High", "Malware detected by Defender"), "1119": ("High", "Defender failed to act on malware"),
+    }
+    for e, (sev, rule) in control_rules.items():
+        idxs = by_eid[e]
+        if e in ("1116", "1117", "1006", "1119", "5001"):
+            idxs = [i for i in idxs if "defender" in rows[i]["Provider"].lower()]
+        if idxs:
+            comps = sorted({rows[i]["Computer"] for i in idxs})
+            add(sev, rule, ", ".join(comps[:5]), idxs, f"{len(idxs)} event(s).")
+
+    # 14. Kerberos attack indicators
+    roast = defaultdict(list)
+    for i in by_eid["4769"]:
+        enc = raw(rows[i], "TicketEncryptionType").lower()
+        svc = raw(rows[i], "ServiceName").lower()
+        if enc in ("0x17", "0x18") and not svc.endswith("$") and svc != "krbtgt":
+            roast[account_name(rows[i])].append(i)
+    for name, idxs in roast.items():
+        svcs = {raw(rows[i], "ServiceName").lower() for i in idxs}
+        if len(svcs) >= KERBEROAST_SERVICES:
+            add("Medium", "Possible Kerberoasting", label(idxs[0]), idxs,
+                f"Requested weak RC4 service tickets for {len(svcs)} different services. "
+                "Attackers do this to crack service account passwords offline.")
+    asrep = [i for i in by_eid["4768"] if raw(rows[i], "PreAuthType") == "0"]
+    if asrep:
+        add("Medium", "Kerberos logon without pre-authentication",
+            ", ".join(sorted({label(i) for i in asrep})[:5]), asrep,
+            "Accounts that don't require pre-authentication can be attacked with AS-REP roasting.")
+
+    # 15. Other logon types and accounts worth a look
+    newcred = [i for i in by_eid["4624"] if raw(rows[i], "LogonType") == "9"]
+    if newcred:
+        add("Low", "NewCredentials logon (logon type 9)", ", ".join(sorted({label(i) for i in newcred})[:5]),
+            newcred, "Used by 'runas /netonly' and also by pass-the-hash tools.")
+    admin = [i for i in by_eid["4624"] + by_eid["4625"] if account_name(rows[i]) == "administrator"]
+    if admin:
+        add("Low", "Built-in Administrator account used", "Administrator", admin,
+            f"{len(admin)} logon event(s). Shared admin accounts make actions hard to attribute.")
+    timechg = [i for i in by_eid["4616"] if is_person({**rows[i], "_data": {"SubjectUserName": raw(rows[i], "SubjectUserName")}})]
+    if timechg:
+        add("Low", "System time changed by a user", ", ".join(sorted({primary_account(rows[i]) for i in timechg})[:5]),
+            timechg, "Changing the clock can be used to confuse log timelines.")
+
+    findings.sort(key=lambda f: (SEVERITY_ORDER[f["severity"]], -len(f["rows"])))
+    flags = defaultdict(set)
+    for f in findings:
+        for i in f["rows"]:
+            flags[i].add(f["rule"])
+    for i, r in enumerate(rows):
+        r["Flags"] = "; ".join(sorted(flags.get(i, ())))
+    return findings
+
+
+# ============================================================================
 #  HTML REPORT
 # ============================================================================
 
@@ -1255,14 +1595,15 @@ CSS = """
 :root {
   --page: #f3f5f6; --sheet: #ffffff; --ink: #1d2830; --muted: #5d6b75;
   --rule: #d6dde1; --band: #eef2f4; --accent: #0e6a70; --accent-soft: #d7eced;
-  --fail: #a8261d; --fail-soft: #f8e3e1; --ok: #2d6e46;
+  --fail: #a8261d; --fail-soft: #f8e3e1; --ok: #2d6e46; --warn: #8a5300; --warn-soft: #fbefd9;
   color-scheme: light;
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
     --page: #15191c; --sheet: #1d2327; --ink: #e3e8eb; --muted: #9aa7b0;
     --rule: #334048; --band: #252d32; --accent: #5cc0c6; --accent-soft: #1f3a3c;
-    --fail: #f08a80; --fail-soft: #3d2422; --ok: #7fc79a; color-scheme: dark;
+    --fail: #f08a80; --fail-soft: #3d2422; --ok: #7fc79a; --warn: #e8b45c; --warn-soft: #3a2e19;
+    color-scheme: dark;
   }
 }
 * { box-sizing: border-box; }
@@ -1323,6 +1664,17 @@ input[type=search] { width: 280px; }
 .res-fail { color: var(--fail); font-weight: 600; }
 .res-ok { color: var(--ok); }
 .empty { padding: 28px; text-align: center; color: var(--muted); }
+.sev { display: inline-block; min-width: 64px; text-align: center; font-size: 12px; font-weight: 700;
+  padding: 2px 8px; border: 1px solid currentColor; }
+.sev-High { color: var(--fail); background: var(--fail-soft); }
+.sev-Medium { color: var(--warn); background: var(--warn-soft); }
+.sev-Low { color: var(--muted); }
+.findings tbody tr { cursor: pointer; }
+.findings tbody tr:hover { background: var(--accent-soft); }
+.findings td.detail { min-width: 320px; }
+.intro { max-width: 900px; color: var(--muted); margin: 0 0 16px; }
+.ledger .warn dd { color: var(--warn); }
+#events td.flag { color: var(--warn); font-weight: 600; }
 footer { margin-top: 40px; color: var(--muted); font-size: 13px; }
 [hidden] { display: none !important; }
 @media (max-width: 640px) {
@@ -1337,13 +1689,14 @@ JS = r"""
 const COLS = __COLS__;
 const KEYN = __KEYN__;
 const DATA = __DATA__;
+const FINDINGS = __FINDINGS__;
 const FAILED_IDS = new Set(__FAILED__);
 const NUMERIC = new Set(["Event ID", "Record", "Source Port"]);
 const idx = Object.fromEntries(COLS.map((c, i) => [c, i]));
 const HAY = DATA.map(r => r.join("\u0001").toLowerCase());
 const fmt = n => n.toLocaleString();
 
-const state = { q: "", result: "", eid: "", failedOnly: false, pinned: null,
+const state = { q: "", result: "", eid: "", failedOnly: false, flaggedOnly: false, pinned: null,
                 sort: 0, dir: 1, page: 0, size: 100, all: false };
 let view = [];
 
@@ -1368,11 +1721,13 @@ $("f-search").addEventListener("input", e => { clearTimeout(timer); timer = setT
 $("f-result").addEventListener("change", e => { state.result = e.target.value; refresh(); });
 $("f-eid").addEventListener("change", e => { state.eid = e.target.value; refresh(); });
 $("f-failed").addEventListener("change", e => { state.failedOnly = e.target.checked; refresh(); });
+$("f-flagged").addEventListener("change", e => { state.flaggedOnly = e.target.checked; refresh(); });
 $("f-size").addEventListener("change", e => { state.size = +e.target.value; state.page = 0; render(); });
 $("f-cols").addEventListener("click", e => { state.all = !state.all; e.target.textContent = state.all ? "Show key columns" : "Show all columns"; render(); });
 $("f-reset").addEventListener("click", () => {
-  Object.assign(state, { q: "", result: "", eid: "", failedOnly: false, pinned: null });
+  Object.assign(state, { q: "", result: "", eid: "", failedOnly: false, flaggedOnly: false, pinned: null });
   $("f-search").value = ""; $("f-result").value = ""; $("f-eid").value = ""; $("f-failed").checked = false;
+  $("f-flagged").checked = false;
   refresh();
 });
 $("chip-clear").addEventListener("click", () => { state.pinned = null; refresh(); });
@@ -1389,13 +1744,25 @@ document.querySelectorAll(".summary tbody tr").forEach(tr => {
   tr.addEventListener("keydown", e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); } });
 });
 
+// ---------- findings open the events behind them
+document.querySelectorAll(".findings tbody tr[data-finding]").forEach(tr => {
+  const go = () => {
+    state.pinned = { rows: new Set(FINDINGS[+tr.dataset.finding]), label: tr.dataset.label };
+    refresh(); showTab("events"); window.scrollTo(0, 0);
+  };
+  tr.addEventListener("click", go);
+  tr.addEventListener("keydown", e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); } });
+});
+
 function isFailed(r) { return r[idx["Result"]] === "Audit Failure" && FAILED_IDS.has(r[idx["Event ID"]]); }
 
 function matches(r, i) {
   if (state.result !== "" && r[idx["Result"]] !== state.result) return false;
   if (state.eid !== "" && r[idx["Event ID"]] !== state.eid) return false;
   if (state.failedOnly && !isFailed(r)) return false;
-  if (state.pinned) {
+  if (state.flaggedOnly && !r[idx["Flags"]]) return false;
+  if (state.pinned && state.pinned.rows) { if (!state.pinned.rows.has(i)) return false; }
+  else if (state.pinned) {
     for (const [k, v] of Object.entries(state.pinned.filter)) {
       if (k === "_failed") { if (!isFailed(r)) return false; }
       else if (r[idx[k]] !== v) return false;
@@ -1455,6 +1822,7 @@ function render() {
       td.title = v;
       if (NUMERIC.has(COLS[c])) td.className = "num";
       if (COLS[c] === "Other Details") td.className = "wrap";
+      if (COLS[c] === "Flags" && v) td.className = "flag";
       if (COLS[c] === "Result") td.className = v === "Audit Failure" ? "res-fail" : v === "Audit Success" ? "res-ok" : "";
       row.appendChild(td);
     }
@@ -1478,8 +1846,26 @@ def esc(v):
     return html.escape(str(v), quote=True)
 
 
-def build_html(rows, sources, out_path):
+def findings_html(findings):
+    if not findings:
+        return '<p class="empty">No suspicious patterns were found with the current settings.</p>'
+    out = []
+    for k, f in enumerate(findings):
+        when = f["first"] if f["first"] == f["last"] else f"{f['first']} to {f['last']}"
+        out.append(
+            f'<tr tabindex="0" data-finding="{k}" data-label="{esc(f["rule"] + ": " + f["who"])}">'
+            f'<td><span class="sev sev-{f["severity"]}">{f["severity"]}</span></td>'
+            f'<td><strong>{esc(f["rule"])}</strong></td><td>{esc(f["who"])}</td>'
+            f'<td>{esc(when)}</td><td class="num">{len(f["rows"]):,}</td>'
+            f'<td class="detail">{esc(f["detail"])}</td></tr>')
+    return ('<div class="scroll"><table class="findings"><thead><tr><th>Severity</th><th>Finding</th>'
+            '<th>Account / source</th><th>When (UTC)</th><th class="num">Events</th><th>Why it matters</th>'
+            f'</tr></thead><tbody>{"".join(out)}</tbody></table></div>')
+
+
+def build_html(rows, sources, out_path, findings):
     sections = build_sections(rows)
+    sev_counts = Counter(f["severity"] for f in findings)
     failed = sum(1 for r in rows if is_failed_logon(r))
     n_fail = sum(1 for r in rows if r["Result"] == "Audit Failure")
     n_ok = sum(1 for r in rows if r["Result"] == "Audit Success")
@@ -1494,11 +1880,13 @@ def build_html(rows, sources, out_path):
         ("Audit success", f"{n_ok:,}", ""),
         ("Audit failure", f"{n_fail:,}", "fail" if n_fail else ""),
         ("Failed logons", f"{failed:,}", "fail" if failed else ""),
+        ("High-severity findings", f"{sev_counts['High']:,}", "fail" if sev_counts["High"] else ""),
+        ("Other findings", f"{sev_counts['Medium'] + sev_counts['Low']:,}", "warn" if sev_counts["Medium"] else ""),
         ("Accounts", f"{accounts:,}", ""),
         ("Computers", f"{computers:,}", ""),
     ]
     ledger_html = "".join(
-        f'<div class="{"fail" if cls == "fail" else ""}"><dt>{esc(k)}</dt>'
+        f'<div class="{cls if cls in ("fail", "warn") else ""}"><dt>{esc(k)}</dt>'
         f'<dd class="{"small" if cls == "small" else ""}">{esc(v)}</dd></div>'
         for k, v, cls in ledger)
 
@@ -1528,6 +1916,7 @@ def build_html(rows, sources, out_path):
     js = (JS.replace("__COLS__", json.dumps(REPORT_COLUMNS))
             .replace("__KEYN__", str(KEY_COLUMN_COUNT))
             .replace("__FAILED__", json.dumps(list(FAILED_LOGON_IDS)))
+            .replace("__FINDINGS__", json.dumps([f["rows"] for f in findings], separators=(",", ":")))
             .replace("__DATA__", json.dumps(data, separators=(",", ":"), ensure_ascii=False)
                      .replace("</", "<\\/")))
 
@@ -1549,6 +1938,7 @@ def build_html(rows, sources, out_path):
 
 <nav class="tabs" role="tablist">
   <button role="tab" data-tab="summary" aria-selected="true">Summary</button>
+  <button role="tab" data-tab="suspicious" aria-selected="false">Suspicious activity ({len(findings)})</button>
   <button role="tab" data-tab="events" aria-selected="false">Events</button>
 </nav>
 
@@ -1558,12 +1948,20 @@ def build_html(rows, sources, out_path):
   <div class="grid">{"".join(blocks)}</div>
 </div>
 
+<div data-panel="suspicious" hidden>
+  <p class="intro">Patterns a security analyst would want to review, most serious first. Off-hours means
+    {OFF_HOURS_START:02d}:00 to {OFF_HOURS_END:02d}:00 local time (UTC{UTC_OFFSET_HOURS:+d}). These are leads,
+    not proof: click a finding to see the events behind it. Thresholds can be changed at the top of the script.</p>
+  {findings_html(findings)}
+</div>
+
 <div data-panel="events" hidden>
   <div class="controls">
     <label>Search every field<input type="search" id="f-search" placeholder="Account, IP, computer, code..."></label>
     <label>Result<select id="f-result"><option value="">All</option></select></label>
     <label>Event ID<select id="f-eid"><option value="">All</option></select></label>
     <label class="check"><input type="checkbox" id="f-failed"> Failed logons only</label>
+    <label class="check"><input type="checkbox" id="f-flagged"> Flagged events only</label>
     <label>Rows per page<select id="f-size"><option>50</option><option selected>100</option><option>250</option><option>500</option></select></label>
     <button class="btn" id="f-cols" type="button">Show all columns</button>
     <button class="btn" id="f-reset" type="button">Clear filters</button>
@@ -1615,13 +2013,20 @@ def main():
     base = files[0] if len(files) == 1 else files[0].parent / files[0].parent.name
     out_path = base.with_name(base.stem + "_report.html")
 
+    findings = detect_suspicious(rows)
+
     print()
     for line in summary_lines(rows):
         print(line)
+    print(f"\n=== Suspicious activity: {len(findings)} finding(s) ===")
+    for f in findings[:15]:
+        print(f"  [{f['severity']:<6}] {f['rule']}: {f['who']} ({len(f['rows']):,} events)")
+    if len(findings) > 15:
+        print(f"  ...and {len(findings) - 15} more in the report.")
 
     start = time.time()
     try:
-        build_html(rows, files, out_path)
+        build_html(rows, files, out_path, findings)
     except PermissionError:
         sys.exit(f"\nCould not save {out_path}. Check that the folder isn't read-only.")
     size_mb = out_path.stat().st_size / 1_048_576
