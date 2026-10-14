@@ -191,3 +191,45 @@ Treat the findings as leads to investigate, not confirmed attacks. For example, 
 Event log report
 PY 
 ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+XML File Parser.py
+PY
+Using this python file, change it so that it also generates a report on the same HTML output for specifically Event IDs 4624 and 4625 and give a number for how many times per hour those event IDs occur
+
+Edited a file, shared a file, and 6 more steps
+I’ve updated XML_File_Parser.py. The HTML report now has a Logons 4624 / 4625 tab between Suspicious activity and Events. I tested it on a made-up log of 300 events, and the page’s JavaScript parses without errors. I haven’t tried it on your real XML data or looked at the page in a browser.
+
+What the new tab shows
+
+Average per hour: a table with the total, average events per hour, busiest hour and the number of hours with any activity, for 4624, 4625 and both combined.
+Hour-by-hour counts: one row per clock hour (UTC), with 4624, 4625, total and % failed. Hours with no events are included and shown in grey.
+Click-through: clicking any row opens just those events in the Events tab, like the other summary tables.
+The script’s console output also prints the per-hour numbers. On my test data it printed 4624: 145 events, 1.06 per hour, 4625: 79 events, 0.58 per hour and Both: 224 events, 1.64 per hour over 137.0 hours.
+
+How “per hour” is calculated: it’s the total count divided by the time between the first and last 4624/4625 event. If that span is under an hour, the script divides by 1 instead. Every hour in that span counts toward the average, including quiet ones. The “hours with activity” column shows how many hours actually had events.
+
+The tab counts 4624 and 4625 by Event ID alone. The existing “Failed logons” figure also includes 4771 and 4776, so the two numbers will differ.
+
+Files are in /home/claude/out:
+
+XML_File_Parser.py
+
+Xml file parser
+PY 
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+Remove the AFC restriction on the code and also generate a list of how many times each user logs onto the network. Also create a frequency chart that supports this
+
+Shared a file, read a file, ran 3 commands
+I’ve made all three changes in XML_File_Parser.py. I ran it on a made-up log and checked the rendered page in a headless browser, but not on your real data.
+
+AFC restriction removed: the EXCLUDE_ACCOUNT_PREFIX setting is deleted, and “Top 25 accounts” now includes every account.
+Logons per user: the Logons 4624 / 4625 tab has a new table for each account. It shows successful logons (4624), failed logons (4625), the total, and when the account was first and last seen. A checkbox, on by default, hides computer accounts like PC1$ and built-ins like SYSTEM, so you see people only. Untick it to see everything. Clicking a row opens that account’s events in the Events tab.
+Frequency chart: a horizontal bar chart of the top 25 user accounts, with successful logons in teal and failed ones stacked in red. The count is printed at the end of each bar. It uses the same light and dark colours as the rest of the report.
+These counts cover only the 4624 and 4625 events, so an account that only appears in other event types won’t be listed. “Logs onto the network” is counted as every successful 4624 logon, not just network logons (type 3). If you want type 3 only, say so and I’ll split it out.
+
+Files are in /home/claude/out:
+
+XML_File_Parser.py
+
+Xml file parser
+PY 
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
