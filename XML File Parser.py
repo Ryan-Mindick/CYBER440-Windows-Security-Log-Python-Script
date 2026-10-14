@@ -26,6 +26,9 @@ LOOK UP A CODE WITHOUT A FILE
 OUTPUT (saved next to the input)
   <name>_report.html   ONE file containing:
                          Summary - totals and breakdown tables
+                         Logons 4624 / 4625 - counts and average events per hour
+                                   for successful / failed logons, plus an
+                                   hour-by-hour table
                          Events  - every event in a searchable, sortable,
                                    filterable table (100 rows per page)
   Click any row in a summary table to see just those events.
@@ -37,7 +40,6 @@ OUTPUT (saved next to the input)
 # Mac example:      "/Users/yourname/Downloads/security_log.xml"
 INPUT_PATH = r"C:\Users\rjmin\Downloads\XML Data"
 OPEN_WHEN_DONE = True      # open the report in your browser when finished
-EXCLUDE_ACCOUNT_PREFIX = "AFC"   # "Top 25 accounts" skips accounts starting with this (not case-sensitive)
 
 # ---- Suspicious activity settings ------------------------------------------
 # Event times are stored in UTC. Set the offset of the time zone the computers
@@ -1228,13 +1230,9 @@ def build_sections(rows):
     add("Events by account type", ["Account type"],
         [([none(t)], n, {"Account Type": t}) for (t,), n in group(rows, lambda r: (r["Account Type"],))],
         "Accounts ending in $ are computer accounts.")
-    prefix = EXCLUDE_ACCOUNT_PREFIX.lower()
-    other_accounts = [r for r in rows
-                      if not (prefix and primary_account(r).lower().startswith(prefix))]
     add("Top 25 accounts", ["Account"],
         [([none(a)], n, {"Primary Account": a})
-         for (a,), n in group(other_accounts, lambda r: (primary_account(r),), 25)],
-        f'Excludes accounts starting with "{EXCLUDE_ACCOUNT_PREFIX}".' if prefix else "")
+         for (a,), n in group(rows, lambda r: (primary_account(r),), 25)])
     add("Top 25 computers", ["Computer"],
         [([none(c)], n, {"Computer": c}) for (c,), n in group(rows, lambda r: (r["Computer"],), 25)])
     add("Top 25 source IP addresses", ["Source IP"],
@@ -1588,6 +1586,75 @@ def detect_suspicious(rows):
 
 
 # ============================================================================
+#  LOGON REPORT: Event IDs 4624 (success) and 4625 (failure), per hour
+# ============================================================================
+
+LOGON_REPORT_IDS = ("4624", "4625")
+
+
+def logon_hourly_stats(rows):
+    """Count 4624 / 4625 events per clock hour (UTC) and work out hourly rates.
+    Returns None if the log has no timed 4624/4625 events."""
+    hits = [(r["_dt"], i, r["Event ID"]) for i, r in enumerate(rows)
+            if r["Event ID"] in LOGON_REPORT_IDS and r["_dt"]]
+    if not hits:
+        return None
+    first = min(h[0] for h in hits)
+    last = max(h[0] for h in hits)
+    # Hours covered = real elapsed time between the first and last 4624/4625 event
+    # (at least 1, so a short log is not inflated).
+    hours_covered = max((last - first).total_seconds() / 3600.0, 1.0)
+
+    buckets = defaultdict(lambda: {"4624": [], "4625": []})
+    for dt, i, eid in hits:
+        buckets[dt.replace(minute=0, second=0, microsecond=0)][eid].append(i)
+
+    # Every clock hour from the first to the last event, including quiet hours.
+    hour_rows = []
+    h = first.replace(minute=0, second=0, microsecond=0)
+    end = last.replace(minute=0, second=0, microsecond=0)
+    while h <= end:
+        b = buckets.get(h, {"4624": [], "4625": []})
+        hour_rows.append({"hour": h, "4624": b["4624"], "4625": b["4625"]})
+        h += timedelta(hours=1)
+
+    per_id = {}
+    for eid in LOGON_REPORT_IDS:
+        total = sum(len(hr[eid]) for hr in hour_rows)
+        peak = max(hour_rows, key=lambda hr: len(hr[eid]))
+        per_id[eid] = {
+            "total": total,
+            "avg": total / hours_covered,
+            "peak_hour": peak["hour"].strftime("%Y-%m-%d %H:00"),
+            "peak_count": len(peak[eid]),
+            "active_hours": sum(1 for hr in hour_rows if hr[eid]),
+        }
+    users = defaultdict(lambda: {"4624": [], "4625": [], "names": Counter(), "person": False})
+    for dt, i, eid in hits:
+        r = rows[i]
+        u = users[account_name(r) or "(unknown)"]
+        u[eid].append(i)
+        u["names"][raw(r, "TargetUserName") or raw(r, "SubjectUserName") or "(unknown)"] += 1
+        u["person"] = u["person"] or is_person(r)
+    user_list = []
+    for key, u in users.items():
+        times = [rows[i]["_dt"] for i in u["4624"] + u["4625"]]
+        user_list.append({
+            "name": u["names"].most_common(1)[0][0], "ok": u["4624"], "fail": u["4625"],
+            "person": u["person"], "first": min(times), "last": max(times)})
+    user_list.sort(key=lambda x: (-len(x["ok"]), -len(x["fail"]), x["name"].lower()))
+    both = sum(p["total"] for p in per_id.values())
+    peak_both = max(hour_rows, key=lambda hr: len(hr["4624"]) + len(hr["4625"]))
+    return {
+        "first": first, "last": last, "hours_covered": hours_covered,
+        "hour_rows": hour_rows, "per_id": per_id, "users": user_list,
+        "combined_total": both, "combined_avg": both / hours_covered,
+        "combined_peak_hour": peak_both["hour"].strftime("%Y-%m-%d %H:00"),
+        "combined_peak_count": len(peak_both["4624"]) + len(peak_both["4625"]),
+    }
+
+
+# ============================================================================
 #  HTML REPORT
 # ============================================================================
 
@@ -1669,6 +1736,10 @@ input[type=search] { width: 280px; }
 .sev-High { color: var(--fail); background: var(--fail-soft); }
 .sev-Medium { color: var(--warn); background: var(--warn-soft); }
 .sev-Low { color: var(--muted); }
+.hourly tbody tr { cursor: pointer; }
+.hourly tbody tr:hover { background: var(--accent-soft); }
+.hourly tbody tr.quiet { color: var(--muted); }
+.tall { max-height: 560px; overflow-y: auto; }
 .findings tbody tr { cursor: pointer; }
 .findings tbody tr:hover { background: var(--accent-soft); }
 .findings td.detail { min-width: 320px; }
@@ -1690,6 +1761,7 @@ const COLS = __COLS__;
 const KEYN = __KEYN__;
 const DATA = __DATA__;
 const FINDINGS = __FINDINGS__;
+const HOURLY = __HOURLY__;
 const FAILED_IDS = new Set(__FAILED__);
 const NUMERIC = new Set(["Event ID", "Record", "Source Port"]);
 const idx = Object.fromEntries(COLS.map((c, i) => [c, i]));
@@ -1753,6 +1825,24 @@ document.querySelectorAll(".findings tbody tr[data-finding]").forEach(tr => {
   tr.addEventListener("click", go);
   tr.addEventListener("keydown", e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); } });
 });
+
+// ---------- logon report rows open the events behind them
+document.querySelectorAll(".hourly tbody tr[data-hourly]").forEach(tr => {
+  const go = () => {
+    state.pinned = { rows: new Set(HOURLY[+tr.dataset.hourly]), label: tr.dataset.label };
+    refresh(); showTab("events"); window.scrollTo(0, 0);
+  };
+  tr.addEventListener("click", go);
+  tr.addEventListener("keydown", e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); } });
+});
+
+// ---------- hide computer / built-in accounts in the per-user table
+const fp = document.getElementById("f-people");
+if (fp) {
+  const apply = () => document.querySelectorAll("#users tbody tr").forEach(tr => {
+    tr.hidden = fp.checked && tr.dataset.person === "0"; });
+  fp.addEventListener("change", apply); apply();
+}
 
 function isFailed(r) { return r[idx["Result"]] === "Audit Failure" && FAILED_IDS.has(r[idx["Event ID"]]); }
 
@@ -1863,8 +1953,139 @@ def findings_html(findings):
             f'</tr></thead><tbody>{"".join(out)}</tbody></table></div>')
 
 
+def user_chart_svg(users, limit):
+    """Horizontal stacked bar chart (inline SVG, follows the page's light/dark colours)."""
+    top = users[:limit]
+    if not top:
+        return '<p class="empty">No data.</p>'
+    mx = max(len(u["ok"]) + len(u["fail"]) for u in top) or 1
+    label_w, bar_w, row_h, pad = 190, 640, 24, 8
+    height = len(top) * row_h + 2 * pad + 22
+    out = [f'<svg viewBox="0 0 {label_w + bar_w + 90} {height}" width="100%" role="img" '
+           f'aria-label="Logons per user" style="max-width:{label_w + bar_w + 90}px">']
+    for k, u in enumerate(top):
+        y = pad + k * row_h
+        a, b = len(u["ok"]), len(u["fail"])
+        wa, wb = bar_w * a / mx, bar_w * b / mx
+        name = u["name"] if len(u["name"]) <= 26 else u["name"][:25] + "\u2026"
+        out.append(f'<text x="{label_w - 8}" y="{y + 15}" text-anchor="end" font-size="13" fill="var(--ink)">'
+                   f'{esc(name)}<title>{esc(u["name"])}</title></text>')
+        out.append(f'<rect x="{label_w}" y="{y + 3}" width="{max(wa, 1 if a else 0):.1f}" height="16" fill="var(--accent)">'
+                   f'<title>{esc(u["name"])}: {a:,} successful</title></rect>')
+        if b:
+            out.append(f'<rect x="{label_w + wa:.1f}" y="{y + 3}" width="{max(wb, 1):.1f}" height="16" fill="var(--fail)">'
+                       f'<title>{esc(u["name"])}: {b:,} failed</title></rect>')
+        out.append(f'<text x="{label_w + wa + wb + 6:.1f}" y="{y + 15}" font-size="12" fill="var(--muted)">{a + b:,}</text>')
+    ly = height - 12
+    out.append(f'<rect x="{label_w}" y="{ly - 9}" width="12" height="12" fill="var(--accent)"/>'
+               f'<text x="{label_w + 18}" y="{ly + 1}" font-size="12" fill="var(--ink)">Successful (4624)</text>'
+               f'<rect x="{label_w + 150}" y="{ly - 9}" width="12" height="12" fill="var(--fail)"/>'
+               f'<text x="{label_w + 168}" y="{ly + 1}" font-size="12" fill="var(--ink)">Failed (4625)</text></svg>')
+    return "".join(out)
+
+
+def logon_report_html(stats):
+    """Returns (html for the Logon report tab, list of row-index lists for the JS)."""
+    if not stats:
+        return '<p class="empty">No Event ID 4624 or 4625 events were found in this log.</p>', []
+    pid = stats["per_id"]
+    desc = {e: SECURITY_EVENTS[int(e)] for e in LOGON_REPORT_IDS}
+
+    ledger = [
+        ("4624 logons (success)", f"{pid['4624']['total']:,}", ""),
+        ("4625 logons (failure)", f"{pid['4625']['total']:,}", "fail" if pid["4625"]["total"] else ""),
+        ("4624 per hour (avg)", f"{pid['4624']['avg']:,.2f}", ""),
+        ("4625 per hour (avg)", f"{pid['4625']['avg']:,.2f}", "fail" if pid["4625"]["total"] else ""),
+        ("Both IDs per hour (avg)", f"{stats['combined_avg']:,.2f}", ""),
+        ("Hours covered", f"{stats['hours_covered']:,.1f}", ""),
+        ("Busiest hour (UTC)", f"{stats['combined_peak_hour']}  ({stats['combined_peak_count']:,} events)", "small"),
+        ("Period (UTC)", f"{stats['first']:%Y-%m-%d %H:%M} to {stats['last']:%Y-%m-%d %H:%M}", "small"),
+    ]
+    ledger_html = "".join(
+        f'<div class="{cls if cls in ("fail", "warn") else ""}"><dt>{esc(k)}</dt>'
+        f'<dd class="{"small" if cls == "small" else ""}">{esc(v)}</dd></div>'
+        for k, v, cls in ledger)
+
+    rate_rows = "".join(
+        f'<tr tabindex="0" data-filter="{esc(json.dumps({"Event ID": e}))}" '
+        f'data-label="{esc("Event ID " + e)}"><td>{e}</td><td>{esc(desc[e])}</td>'
+        f'<td class="num">{pid[e]["total"]:,}</td><td class="num">{pid[e]["avg"]:,.2f}</td>'
+        f'<td>{esc(pid[e]["peak_hour"])}</td><td class="num">{pid[e]["peak_count"]:,}</td>'
+        f'<td class="num">{pid[e]["active_hours"]:,}</td></tr>'
+        for e in LOGON_REPORT_IDS)
+    rate_rows += (
+        f'<tr><td><strong>Both</strong></td><td>4624 + 4625 combined</td>'
+        f'<td class="num"><strong>{stats["combined_total"]:,}</strong></td>'
+        f'<td class="num"><strong>{stats["combined_avg"]:,.2f}</strong></td>'
+        f'<td>{esc(stats["combined_peak_hour"])}</td>'
+        f'<td class="num">{stats["combined_peak_count"]:,}</td><td></td></tr>')
+
+    hourly_idx, body = [], []
+    top = max((len(h["4624"]) + len(h["4625"]) for h in stats["hour_rows"]), default=1) or 1
+    for h in stats["hour_rows"]:
+        a, b = len(h["4624"]), len(h["4625"])
+        total = a + b
+        pct = f"{100 * b / total:.0f}%" if total else ""
+        label = h["hour"].strftime("%Y-%m-%d %H:00")
+        width = max(1, round(100 * total / top)) if total else 0
+        if total:
+            hourly_idx.append(sorted(h["4624"] + h["4625"]))
+            attrs = (f'tabindex="0" data-hourly="{len(hourly_idx) - 1}" '
+                     f'data-label="{esc("Logon events at " + label + " UTC")}"')
+        else:
+            attrs = 'class="quiet"'
+        body.append(
+            f'<tr {attrs}><td>{label}</td><td class="num">{a:,}</td><td class="num">{b:,}</td>'
+            f'<td class="num">{total:,}<span class="share" style="width:{width}%"></span></td>'
+            f'<td class="num">{pct}</td></tr>')
+
+    # ---- per-user logon counts + frequency chart
+    users = stats["users"]
+    ubody = []
+    for k, u in enumerate(users):
+        hourly_idx.append(sorted(u["ok"] + u["fail"]))
+        ubody.append(
+            f'<tr tabindex="0" data-hourly="{len(hourly_idx) - 1}" data-person="{1 if u["person"] else 0}" '
+            f'data-label="{esc("Logon events for " + u["name"])}"><td>{esc(u["name"])}</td>'
+            f'<td>{"User" if u["person"] else "Computer / built-in"}</td>'
+            f'<td class="num">{len(u["ok"]):,}</td><td class="num">{len(u["fail"]):,}</td>'
+            f'<td class="num">{len(u["ok"]) + len(u["fail"]):,}</td>'
+            f'<td>{u["first"]:%Y-%m-%d %H:%M}</td><td>{u["last"]:%Y-%m-%d %H:%M}</td></tr>')
+    n_people = sum(1 for u in users if u["person"])
+    chart = user_chart_svg([u for u in users if u["person"]] or users, 25)
+
+    page = f"""
+  <p class="intro">Event ID 4624 (successful logon) and 4625 (failed logon), counted per clock hour in UTC.
+    "Per hour (avg)" is the total divided by the hours between the first and last of these events
+    ({stats['hours_covered']:,.1f} hours, minimum 1). Click a row to see its events.</p>
+  <dl class="ledger">{ledger_html}</dl>
+  <section class="block" style="margin-bottom:28px"><h2>Average events per hour</h2>
+    <div class="scroll"><table class="summary hourly"><thead><tr><th>Event ID</th><th>Description</th>
+      <th class="num">Total</th><th class="num">Avg per hour</th><th>Busiest hour (UTC)</th>
+      <th class="num">Events in busiest hour</th><th class="num">Hours with activity</th></tr></thead>
+      <tbody>{rate_rows}</tbody></table></div></section>
+  <section class="block"><h2>Hour-by-hour counts</h2>
+    <p class="note">Quiet hours (no 4624/4625 events) are shown in grey.</p>
+    <div class="scroll tall"><table class="hourly"><thead><tr><th>Hour (UTC)</th>
+      <th class="num">4624 success</th><th class="num">4625 failure</th><th class="num">Total</th>
+      <th class="num">% failed</th></tr></thead><tbody>{"".join(body)}</tbody></table></div></section>
+  <section class="block" style="margin-top:28px"><h2>Logon frequency by user</h2>
+    <p class="note">Top 25 {"user accounts" if n_people else "accounts"} by successful logons (4624). Failed logons (4625) are stacked in red.</p>
+    <div class="scroll" style="padding:12px">{chart}</div></section>
+  <section class="block" style="margin-top:28px"><h2>Logons per user ({len(users):,} accounts)</h2>
+    <p class="note">How many times each account logged on (4624) or failed to (4625). Click a row to see its events.</p>
+    <div class="controls"><label class="check"><input type="checkbox" id="f-people" checked>
+      Show user accounts only (hide computer accounts such as NAME$ and built-ins such as SYSTEM)</label></div>
+    <div class="scroll tall"><table class="hourly" id="users"><thead><tr><th>Account</th><th>Type</th>
+      <th class="num">Logons (4624)</th><th class="num">Failed (4625)</th><th class="num">Total</th>
+      <th>First seen (UTC)</th><th>Last seen (UTC)</th></tr></thead><tbody>{"".join(ubody)}</tbody></table></div></section>"""
+    return page, hourly_idx
+
+
 def build_html(rows, sources, out_path, findings):
     sections = build_sections(rows)
+    logon_stats = logon_hourly_stats(rows)
+    logon_html, hourly_idx = logon_report_html(logon_stats)
     sev_counts = Counter(f["severity"] for f in findings)
     failed = sum(1 for r in rows if is_failed_logon(r))
     n_fail = sum(1 for r in rows if r["Result"] == "Audit Failure")
@@ -1915,6 +2136,7 @@ def build_html(rows, sources, out_path, findings):
     data = [[primary_account(r) if c == "Primary Account" else r[c] for c in REPORT_COLUMNS] for r in rows]
     js = (JS.replace("__COLS__", json.dumps(REPORT_COLUMNS))
             .replace("__KEYN__", str(KEY_COLUMN_COUNT))
+            .replace("__HOURLY__", json.dumps(hourly_idx, separators=(",", ":")))
             .replace("__FAILED__", json.dumps(list(FAILED_LOGON_IDS)))
             .replace("__FINDINGS__", json.dumps([f["rows"] for f in findings], separators=(",", ":")))
             .replace("__DATA__", json.dumps(data, separators=(",", ":"), ensure_ascii=False)
@@ -1939,6 +2161,7 @@ def build_html(rows, sources, out_path, findings):
 <nav class="tabs" role="tablist">
   <button role="tab" data-tab="summary" aria-selected="true">Summary</button>
   <button role="tab" data-tab="suspicious" aria-selected="false">Suspicious activity ({len(findings)})</button>
+  <button role="tab" data-tab="logons" aria-selected="false">Logons 4624 / 4625</button>
   <button role="tab" data-tab="events" aria-selected="false">Events</button>
 </nav>
 
@@ -1953,6 +2176,9 @@ def build_html(rows, sources, out_path, findings):
     {OFF_HOURS_START:02d}:00 to {OFF_HOURS_END:02d}:00 local time (UTC{UTC_OFFSET_HOURS:+d}). These are leads,
     not proof: click a finding to see the events behind it. Thresholds can be changed at the top of the script.</p>
   {findings_html(findings)}
+</div>
+
+<div data-panel="logons" hidden>{logon_html}
 </div>
 
 <div data-panel="events" hidden>
@@ -2018,6 +2244,18 @@ def main():
     print()
     for line in summary_lines(rows):
         print(line)
+    ls = logon_hourly_stats(rows)
+    print("\n=== Logon events per hour (4624 / 4625) ===")
+    if ls:
+        for e in LOGON_REPORT_IDS:
+            p = ls["per_id"][e]
+            print(f"  {e}: {p['total']:,} events, {p['avg']:,.2f} per hour "
+                  f"(peak {p['peak_count']:,} at {p['peak_hour']} UTC)")
+        print(f"  Both: {ls['combined_total']:,} events, {ls['combined_avg']:,.2f} per hour "
+              f"over {ls['hours_covered']:,.1f} hours")
+    else:
+        print("  No 4624 or 4625 events found.")
+
     print(f"\n=== Suspicious activity: {len(findings)} finding(s) ===")
     for f in findings[:15]:
         print(f"  [{f['severity']:<6}] {f['rule']}: {f['who']} ({len(f['rows']):,} events)")
